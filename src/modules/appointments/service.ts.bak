@@ -1,0 +1,131 @@
+import { patientNowClient, withApiKeyParams } from '../../integrations/patientnow/client.js'
+import { ghlClient } from '../../integrations/ghl/client.js'
+import { env } from '../../config/env.js'
+
+export type PatientNowAppointment = {
+    AppointmentId: string
+    CustomerId: string
+    StartDate: string
+    EndDate: string
+    ServiceName?: string
+    ProviderName?: string
+    Status?: string
+    Notes?: string
+}
+
+export async function fetchPatientNowAppointments(params: Record<string, any> = {}) {
+    const res = await patientNowClient.get('/api/v1/appointments', withApiKeyParams(params))
+    return res.data
+}
+
+async function findGhlContactByCustomerId(customerId: string): Promise<string | null> {
+    try {
+        const res = await ghlClient.get('/contacts/search', {
+            params: {
+                locationId: env.GHL_LOCATION_ID,
+                query: customerId,
+            },
+        })
+        const contacts = res.data?.contacts ?? []
+        const match = contacts.find((c: any) =>
+            c.customFields?.some((f: any) => f.key === 'patientnow_customer_id' && f.value === customerId)
+        )
+        return match?.id ?? null
+    } catch {
+        return null
+    }
+}
+
+function mapAppointmentToGhlEvent(appointment: PatientNowAppointment, contactId: string) {
+    const startTime = new Date(appointment.StartDate).toISOString()
+    const endTime = appointment.EndDate
+        ? new Date(appointment.EndDate).toISOString()
+        : new Date(new Date(appointment.StartDate).getTime() + 60 * 60 * 1000).toISOString()
+
+    return {
+        calendarId: env.GHL_CALENDAR_ID,
+        locationId: env.GHL_LOCATION_ID,
+        contactId,
+        startTime,
+        endTime,
+        title: appointment.ServiceName || 'PatientNow Appointment',
+        appointmentStatus: appointment.Status?.toLowerCase() === 'cancelled' ? 'cancelled' : 'confirmed',
+        notes: [
+            appointment.ServiceName ? `Service: ${appointment.ServiceName}` : '',
+            appointment.ProviderName ? `Provider: ${appointment.ProviderName}` : '',
+            appointment.Notes ? `Notes: ${appointment.Notes}` : '',
+            `PatientNow ID: ${appointment.AppointmentId}`,
+        ].filter(Boolean).join('\n'),
+    }
+}
+
+export async function syncAppointments(dryRun = false) {
+    const appointments: PatientNowAppointment[] = await fetchPatientNowAppointments({
+        startDate: '2025-01-01',
+        endDate: '2026-12-31',
+    })
+
+    if (!Array.isArray(appointments) || appointments.length === 0) {
+        return {
+            ok: true,
+            sourceCount: 0,
+            message: 'No appointments found in PatientNow',
+        }
+    }
+
+    if (dryRun) {
+        return {
+            ok: true,
+            dryRun: true,
+            sourceCount: appointments.length,
+            dataPreview: appointments.slice(0, 3),
+            message: 'Dry run: appointments fetched, no GHL events created',
+        }
+    }
+
+    const succeeded: { appointmentId: string; ghlEventId?: string }[] = []
+    const failed: { appointmentId: string; error: string }[] = []
+
+    for (const appointment of appointments) {
+        try {
+            const contactId = await findGhlContactByCustomerId(appointment.CustomerId)
+
+            if (!contactId) {
+                failed.push({
+                    appointmentId: appointment.AppointmentId,
+                    error: `No GHL contact found for CustomerId: ${appointment.CustomerId}`,
+                })
+                continue
+            }
+
+            const payload = mapAppointmentToGhlEvent(appointment, contactId)
+            const res = await ghlClient.post('/calendars/events/appointments', payload)
+
+            succeeded.push({
+                appointmentId: appointment.AppointmentId,
+                ghlEventId: res.data?.id,
+            })
+        } catch (err: any) {
+            const message = err?.response?.data
+                ? JSON.stringify(err.response.data)
+                : err?.message ?? String(err)
+            failed.push({
+                appointmentId: appointment.AppointmentId,
+                error: message,
+            })
+        }
+    }
+
+    return {
+        ok: failed.length === 0,
+        sourceCount: appointments.length,
+        syncedCount: succeeded.length,
+        failedCount: failed.length,
+        syncedPreview: succeeded.slice(0, 5),
+        errors: failed.slice(0, 10),
+        message:
+            failed.length === 0
+                ? `All ${succeeded.length} appointments synced to GHL`
+                : `Synced ${succeeded.length}, failed ${failed.length}`,
+    }
+}
