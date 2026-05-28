@@ -3,6 +3,8 @@ import { ghlClient } from '../../integrations/ghl/client.js'
 import { env } from '../../config/env.js'
 import { getSyncSince, saveSyncTimestamp } from '../../lib/sync-state.js'
 
+console.log('CONTACTS SERVICE ACTUAL FILE LOADED')
+
 export type PatientNowCustomer = {
     CustomerId: string
     CompanyId?: string
@@ -33,6 +35,32 @@ export type PatientNowCustomer = {
     MobileProviderType: number
 }
 
+type PatientNowPurchaseLineItem = {
+    Item?: string
+    Description?: string
+    Service?: string
+    RetailPrice?: number
+    ExtendedPrice?: number
+    Qty?: number
+    ServiceDate?: string
+}
+
+type PatientNowPurchase = {
+    OrderId?: string
+    OrderDate?: string
+    ServiceDate?: string
+    CustomerId?: string
+    LineItems?: PatientNowPurchaseLineItem[]
+}
+
+function normalizeArray<T>(value: any): T[] {
+    if (Array.isArray(value)) return value
+    if (Array.isArray(value?.data)) return value.data
+    if (Array.isArray(value?.items)) return value.items
+    if (Array.isArray(value?.value)) return value.value
+    return []
+}
+
 export async function fetchPatientNowContacts(params: Record<string, any> = {}): Promise<PatientNowCustomer[]> {
     const res = await patientNowClient.get('/api/v1/customers', withApiKeyParams(params))
 
@@ -42,7 +70,92 @@ export async function fetchPatientNowContacts(params: Record<string, any> = {}):
     return res.data
 }
 
-export function mapPatientNowCustomerToGhlContact(customer: PatientNowCustomer) {
+export async function fetchPatientNowPurchasesByCustomerId(
+    customerId: string,
+    params: Record<string, any> = {},
+): Promise<PatientNowPurchase[]> {
+    const res = await patientNowClient.post(
+        `/api/v1/customers/${customerId}/Purchases`,
+        {},
+        withApiKeyParams({
+            StartDate: '2020-01-01',
+            EndDate: '2035-12-31',
+            Page: 1,
+            Rows: 200,
+            ...params,
+        }),
+    )
+
+    return normalizeArray<PatientNowPurchase>(res.data)
+}
+
+function formatMoney(value: any): string {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return ''
+    return `$${num.toFixed(2)}`
+}
+
+function formatDate(value: any): string {
+    if (!value) return ''
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) return String(value)
+    return date.toISOString().slice(0, 10)
+}
+
+export function formatPatientNowSalesSummary(purchases: PatientNowPurchase[]): string {
+    const lines: string[] = []
+
+    for (const purchase of purchases) {
+        const lineItems = Array.isArray((purchase as any).LineItems) ? (purchase as any).LineItems : []
+
+        if (lineItems.length > 0) {
+            for (const item of lineItems) {
+                const title = String(
+                    item.Item ||
+                    item.Description ||
+                    item.Service ||
+                    '',
+                ).trim()
+
+                const amount = item.ExtendedPrice ?? item.RetailPrice ?? null
+                const date = formatDate(item.ServiceDate || purchase.ServiceDate || purchase.OrderDate)
+
+                if (!title && amount == null && !date) continue
+
+                const parts = [
+                    title || 'Purchase',
+                    amount != null ? formatMoney(amount) : '',
+                    date,
+                ].filter(Boolean)
+
+                lines.push(parts.join(' — '))
+            }
+
+            continue
+        }
+
+        const flatTitle = String((purchase as any).Item || (purchase as any).Description || '').trim()
+        const flatAmount = (purchase as any).Amount ?? (purchase as any).ExtendedPrice ?? (purchase as any).RetailPrice ?? null
+        const flatDate = formatDate((purchase as any).OrderDate || (purchase as any).ServiceDate)
+
+        if (!flatTitle && flatAmount == null && !flatDate) continue
+
+        const flatParts = [
+            flatTitle || 'Purchase',
+            flatAmount != null ? formatMoney(flatAmount) : '',
+            flatDate,
+        ].filter(Boolean)
+
+        lines.push(flatParts.join(' — '))
+    }
+
+    return lines.slice(0, 20).join('\n')
+}
+
+export function mapPatientNowCustomerToGhlContact(
+    customer: PatientNowCustomer,
+    salesSummary = '',
+) {
     const phone =
         customer.MobilePhone ||
         customer.HomePhone ||
@@ -76,6 +189,10 @@ export function mapPatientNowCustomerToGhlContact(customer: PatientNowCustomer) 
             {
                 key: 'patientnow_initial_visit',
                 field_value: customer.InitialVisit || '',
+            },
+            {
+                key: 'patientnow_sales_summary',
+                field_value: salesSummary || '',
             },
         ],
     }
@@ -271,6 +388,7 @@ export async function updatePatientNowCustomer(customerId: string, payload: Pati
 }
 
 export async function syncContacts(dryRun = false) {
+    console.log('SYNC CONTACTS NEW CODE ENTERED')
     const since = getSyncSince('contacts')
     const syncStartedAt = new Date().toISOString()
 
@@ -291,7 +409,31 @@ export async function syncContacts(dryRun = false) {
         }
     }
 
-    const mapped = patientNowContacts.map(mapPatientNowCustomerToGhlContact)
+    const mapped = await Promise.all(
+        patientNowContacts.map(async (customer) => {
+            let salesSummary = ''
+
+            console.log('PURCHASES FETCH START', customer.CustomerId, customer.Email)
+
+            try {
+                const purchases = await fetchPatientNowPurchasesByCustomerId(customer.CustomerId)
+                console.log('PURCHASES FETCH RESULT', customer.CustomerId, JSON.stringify({
+                    count: Array.isArray(purchases) ? purchases.length : -1,
+                    sample: Array.isArray(purchases) ? purchases.slice(0, 1) : purchases,
+                }, null, 2))
+                salesSummary = formatPatientNowSalesSummary(purchases)
+                console.log('SALES SUMMARY RESULT', customer.CustomerId, salesSummary)
+            } catch (err: any) {
+                console.log('PatientNow purchases fetch failed:', JSON.stringify({
+                    customerId: customer.CustomerId,
+                    email: customer.Email,
+                    error: err?.response?.data ?? err?.message ?? String(err),
+                }, null, 2))
+            }
+
+            return mapPatientNowCustomerToGhlContact(customer, salesSummary)
+        }),
+    )
 
     if (dryRun) {
         return {
