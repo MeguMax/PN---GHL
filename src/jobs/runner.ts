@@ -2,7 +2,7 @@ import { syncContacts, syncContactsReverse } from '../modules/contacts/service.j
 import { syncAppointments, syncGhlAppointmentsReverse } from '../modules/appointments/service.js'
 import { syncPurchases } from '../modules/purchase-history/purchases-service.js'
 
-const CYCLE_DELAY_MS = Number(process.env.SYNC_CYCLE_DELAY_MS ?? 60_000)
+const CYCLE_DELAY_MS = Number(process.env.SYNC_CYCLE_DELAY_MS ?? 900_000)
 
 let started = false
 let running = false

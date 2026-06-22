@@ -1,0 +1,34 @@
+cd ~/PN---GHL
+git pull origin main
+npm install
+npm run build
+sudo systemctl restart patientnow-ghl
+sudo systemctl status patientnow-ghl
+curl http://localhost:3001/health
+
+# Статус
+sudo systemctl status patientnow-ghl
+curl http://localhost:3001/health
+sudo systemctl status patientnow-ghl
+
+# Остановить / запустить / перезапустить
+sudo systemctl stop patientnow-ghl
+sudo systemctl start patientnow-ghl
+sudo systemctl restart patientnow-ghl
+
+# Логи (tail)
+journalctl -u patientnow-ghl -f
+
+curl -X POST http://localhost:3001/sync/contacts \
+  -H "Content-Type: application/json" \
+  -d '{"dryRun": true}'
+
+curl -X POST http://localhost:3001/sync/appointments \
+  -H "Content-Type: application/json" \
+  -d '{"dryRun": true}'
+
+curl -X POST http://localhost:3001/sync/purchases \
+  -H "Content-Type: application/json" \
+  -d '{"dryRun": true}'
+
+journalctl -u patientnow-ghl -f
